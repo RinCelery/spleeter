@@ -17,7 +17,7 @@ import logging
 
 from time import time
 from multiprocessing import Pool
-from os.path import basename, join, splitext
+from os.path import basename, join, splitext, dirname
 import numpy as np
 import tensorflow as tf
 from librosa.core import stft, istft
@@ -60,10 +60,19 @@ class Separator(object):
         self._params = load_configuration(params_descriptor)
         self._sample_rate = self._params['sample_rate']
         self._MWF = MWF
+        self._tf_graph = tf.Graph()
         self._predictor = None
+        self._input_provider = None
+        self._builder = None
+        self._features = None
+        self._session = None
         self._pool = Pool() if multiprocess else None
         self._tasks = []
         self._params["stft_backend"] = get_backend(stft_backend)
+
+    def __del__(self):
+        if self._session:
+            self._session.close()
 
     def _get_predictor(self):
         """ Lazy loading access method for internal predictor instance.
@@ -85,15 +94,9 @@ class Separator(object):
             task.get()
             task.wait(timeout=timeout)
 
-    def separate_tensorflow(self, waveform, audio_descriptor):
-        """ Performs source separation over the given waveform.
-
-        The separation is performed synchronously but the result
-        processing is done asynchronously, allowing for instance
-        to export audio in parallel (through multiprocessing).
-
-        Given result is passed by to the given consumer, which will
-        be waited for task finishing if synchronous flag is True.
+    def _separate_tensorflow(self, waveform, audio_descriptor):
+        """
+        Performs source separation over the given waveform with tensorflow backend.
 
         :param waveform: Waveform to apply separation on.
         :returns: Separated waveforms.
@@ -107,7 +110,7 @@ class Separator(object):
         prediction.pop('audio_id')
         return prediction
 
-    def stft(self, data, inverse=False, length=None):
+    def _stft(self, data, inverse=False, length=None):
         """
         Single entrypoint for both stft and istft. This computes stft and istft with librosa on stereo data. The two
         channels are processed separately and are concatenated together in the result. The expected input formats are:
@@ -123,38 +126,73 @@ class Separator(object):
         win = hann(N, sym=False)
         fstft = istft if inverse else stft
         win_len_arg = {"win_length": None, "length": length} if inverse else {"n_fft": N}
-        dl, dr = (data[:, :, 0].T, data[:, :, 1].T) if inverse else (data[:, 0], data[:, 1])
-        s1 = fstft(dl, hop_length=H, window=win, center=False, **win_len_arg)
-        s2 = fstft(dr, hop_length=H, window=win, center=False, **win_len_arg)
-        s1 = np.expand_dims(s1.T, 2-inverse)
-        s2 = np.expand_dims(s2.T, 2-inverse)
-        return np.concatenate([s1, s2], axis=2-inverse)
+        n_channels = data.shape[-1]
+        out = []
+        for c in range(n_channels):
+            d = data[:, :, c].T if inverse else data[:, c]
+            s = fstft(d, hop_length=H, window=win, center=False, **win_len_arg)
+            s = np.expand_dims(s.T, 2-inverse)
+            out.append(s)
+        if len(out) == 1:
+            return out[0]
+        return np.concatenate(out, axis=2-inverse)
 
-    def separate_librosa(self, waveform, audio_id):
-        out = {}
-        input_provider = InputProviderFactory.get(self._params)
-        features = input_provider.get_input_dict_placeholders()
 
-        builder = EstimatorSpecBuilder(features, self._params)
-        latest_checkpoint = tf.train.latest_checkpoint(get_default_model_dir(self._params['model_dir']))
+    def _get_input_provider(self):
+        if self._input_provider is None:
+            self._input_provider = InputProviderFactory.get(self._params)
+        return self._input_provider
 
-        # TODO: fix the logic, build sometimes return, sometimes set attribute
-        outputs = builder.outputs
+    def _get_features(self):
+        if self._features is None:
+            self._features = self._get_input_provider().get_input_dict_placeholders()
+        return self._features
 
-        saver = tf.train.Saver()
-        stft = self.stft(waveform)
-        with tf.Session() as sess:
-            saver.restore(sess, latest_checkpoint)
-            outputs = sess.run(outputs, feed_dict=input_provider.get_feed_dict(features, stft, audio_id))
-            for inst in builder.instruments:
-                out[inst] = self.stft(outputs[inst], inverse=True, length=waveform.shape[0])
-        return out
+    def _get_builder(self):
+        if self._builder is None:
+            self._builder = EstimatorSpecBuilder(self._get_features(), self._params)
+        return self._builder
 
-    def separate(self, waveform, audio_descriptor):
+    def _get_session(self):
+        if self._session is None:
+            saver = tf.train.Saver()
+            latest_checkpoint = tf.train.latest_checkpoint(get_default_model_dir(self._params['model_dir']))
+            self._session = tf.Session()
+            saver.restore(self._session, latest_checkpoint)
+        return self._session
+
+    def _separate_librosa(self, waveform, audio_id):
+        """
+        Performs separation with librosa backend for STFT.
+        """
+        with self._tf_graph.as_default():
+            out = {}
+            features = self._get_features()
+
+            # TODO: fix the logic, build sometimes return, sometimes set attribute
+            outputs = self._get_builder().outputs
+            stft = self._stft(waveform)
+            if stft.shape[-1] == 1:
+                stft = np.concatenate([stft, stft], axis=-1)
+            elif stft.shape[-1] > 2:
+                stft = stft[:, :2]
+
+            sess = self._get_session()
+            outputs = sess.run(outputs, feed_dict=self._get_input_provider().get_feed_dict(features, stft, audio_id))
+            for inst in self._get_builder().instruments:
+                out[inst] = self._stft(outputs[inst], inverse=True, length=waveform.shape[0])
+            return out
+
+    def separate(self, waveform, audio_descriptor=""):
+        """ Performs separation on a waveform.
+
+        :param waveform:            Waveform to be separated (as a numpy array)
+        :param audio_descriptor:    (Optional) string describing the waveform (e.g. filename).
+        """
         if self._params["stft_backend"] == "tensorflow":
-            return self.separate_tensorflow(waveform, audio_descriptor)
+            return self._separate_tensorflow(waveform, audio_descriptor)
         else:
-            return self.separate_librosa(waveform, audio_descriptor)
+            return self._separate_librosa(waveform, audio_descriptor)
 
     def separate_to_file(
             self, audio_descriptor, destination,
@@ -166,7 +204,7 @@ class Separator(object):
         given audio adapter.
 
         Filename format should be a Python formattable string that could use
-        following parameters : {instrument}, {filename} and {codec}.
+        following parameters : {instrument}, {filename}, {foldername} and {codec}.
 
         :param audio_descriptor:    Describe song to separate, used by audio
                                     adapter to retrieve and load audio data,
@@ -174,10 +212,9 @@ class Separator(object):
                                     descriptor would be a file path.
         :param destination:         Target directory to write output to.
         :param audio_adapter:       (Optional) Audio adapter to use for I/O.
-        :param chunk_duration:      (Optional) Maximum signal duration that is processed
-                                               in one pass. Default: all signal.
         :param offset:              (Optional) Offset of loaded song.
-        :param duration:            (Optional) Duration of loaded song.
+        :param duration:            (Optional) Duration of loaded song (default:
+                                    600s).
         :param codec:               (Optional) Export codec.
         :param bitrate:             (Optional) Export bitrate.
         :param filename_format:     (Optional) Filename format.
@@ -189,18 +226,45 @@ class Separator(object):
             duration=duration,
             sample_rate=self._sample_rate)
         sources = self.separate(waveform, audio_descriptor)
-        self.save_to_file(sources, audio_descriptor, destination, filename_format, codec,
-                          audio_adapter, bitrate, synchronous)
+        self.save_to_file(  sources, audio_descriptor, destination,
+                            filename_format, codec, audio_adapter,
+                            bitrate, synchronous)
 
-    def save_to_file(self, sources, audio_descriptor, destination, filename_format, codec,
-                     audio_adapter, bitrate, synchronous):
+    def save_to_file(
+            self, sources, audio_descriptor, destination,
+            filename_format='{filename}/{instrument}.{codec}',
+            codec='wav', audio_adapter=get_default_audio_adapter(),
+            bitrate='128k', synchronous=True):
+        """ export dictionary of sources to files.
+
+        :param sources:             Dictionary of sources to be exported. The
+                                    keys are the name of the instruments, and
+                                    the values are Nx2 numpy arrays containing
+                                    the corresponding intrument waveform, as
+                                    returned by the separate method
+        :param audio_descriptor:    Describe song to separate, used by audio
+                                    adapter to retrieve and load audio data,
+                                    in case of file based audio adapter, such
+                                    descriptor would be a file path.
+        :param destination:         Target directory to write output to.
+        :param filename_format:     (Optional) Filename format.
+        :param codec:               (Optional) Export codec.
+        :param audio_adapter:       (Optional) Audio adapter to use for I/O.
+        :param bitrate:             (Optional) Export bitrate.
+        :param synchronous:         (Optional) True is should by synchronous.
+
+        """
+
+        foldername = basename(dirname(audio_descriptor))
         filename = splitext(basename(audio_descriptor))[0]
         generated = []
         for instrument, data in sources.items():
             path = join(destination, filename_format.format(
                 filename=filename,
                 instrument=instrument,
-                codec=codec))
+                foldername=foldername,
+                codec=codec,
+                ))
             directory = os.path.dirname(path)
             if not os.path.exists(directory):
                 os.makedirs(directory)
